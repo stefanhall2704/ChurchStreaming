@@ -47,7 +47,7 @@ jobs:
 
   deploy:
     needs: build
-    runs-on: [self-hosted, raspberry-pi]
+    runs-on: [self-hosted, Linux, ARM64]
 
     steps:
       - uses: actions/download-artifact@v4
