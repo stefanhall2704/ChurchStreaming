@@ -519,7 +519,7 @@ fn active_names(cfg: &Config) -> Vec<String> {
 fn spawn_ffmpeg_preview(cfg: &Config) -> anyhow::Result<tokio::process::Child> {
     Command::new("ffmpeg")
         .args([
-            "-hide_banner", "-loglevel", "warning",
+            "-hide_banner", "-loglevel", "level+info",
             "-progress", "pipe:2",
             "-fflags", "+discardcorrupt",
             "-err_detect", "ignore_err",
@@ -532,7 +532,7 @@ fn spawn_ffmpeg_preview(cfg: &Config) -> anyhow::Result<tokio::process::Child> {
             "-hls_segment_filename", &format!("{HLS_DIR}/seg%03d.ts"),
             &format!("{HLS_DIR}/stream.m3u8"),
             "-map", "0:a",
-            "-af", "ebur128=framelog=24",
+            "-af", "ebur128",
             "-f", "null", "-",
         ])
         .stderr(std::process::Stdio::piped())
@@ -557,7 +557,7 @@ fn spawn_ffmpeg_ingest(cfg: &Config, num_dests: usize) -> anyhow::Result<tokio::
         .join("|");
 
     let args: Vec<String> = vec![
-        "-hide_banner".into(), "-loglevel".into(), "warning".into(),
+        "-hide_banner".into(), "-loglevel".into(), "level+info".into(),
         "-progress".into(), "pipe:2".into(),
         "-fflags".into(), "+discardcorrupt".into(),
         "-err_detect".into(), "ignore_err".into(),
@@ -578,7 +578,7 @@ fn spawn_ffmpeg_ingest(cfg: &Config, num_dests: usize) -> anyhow::Result<tokio::
         hls_m3u8,
         // Audio loudness analysis
         "-map".into(), "0:a".into(),
-        "-af".into(), "ebur128=framelog=24".into(),
+        "-af".into(), "ebur128".into(),
         "-f".into(), "null".into(), "-".into(),
     ];
 
@@ -738,9 +738,11 @@ async fn parse_telemetry(
                 if let Some(lufs) = parse_ebur128_m(&line) {
                     let level = ((lufs + 70.0) / 70.0).clamp(0.0, 1.0);
                     let _ = audio_tx.send(level);
-                } else {
-                    info!("ffmpeg: {line}");
+                } else if line.contains("[warning]") || line.contains("[error]")
+                       || line.contains("[fatal]")   || line.contains("[panic]") {
+                    warn!("ffmpeg: {line}");
                 }
+                // [info] lines from FFmpeg are noise — silently dropped
             }
         }
     }
