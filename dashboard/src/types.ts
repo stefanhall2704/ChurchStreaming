@@ -10,16 +10,19 @@ export interface Destination {
   has_credentials: boolean   // Google client_id + secret configured
 }
 
+export type DestinationStatus = 'streaming' | 'retrying' | 'failed'
+
 export interface Status {
-  phase:               Phase
-  bitrate_kbps:        number
-  fps:                 number
-  drop_frames:         number
-  uptime_secs:         number
-  retry_count:         number
-  error_message:       string | null
-  cpu_temp_celsius:    number
-  active_destinations: string[]
+  phase:                Phase
+  bitrate_kbps:         number
+  fps:                  number
+  drop_frames:          number
+  uptime_secs:          number
+  retry_count:          number
+  error_message:        string | null
+  cpu_temp_celsius:     number
+  active_destinations:  string[]
+  destination_statuses: Record<string, DestinationStatus>
 }
 
 export interface ConfigInfo {

@@ -128,7 +128,10 @@ export default function App() {
 
       {/* Destinations + Settings */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
-        <DestinationsPanel />
+        <DestinationsPanel
+          statuses={status?.destination_statuses ?? {}}
+          phase={status?.phase ?? 'idle'}
+        />
         <ConfigEditor />
       </div>
     </div>

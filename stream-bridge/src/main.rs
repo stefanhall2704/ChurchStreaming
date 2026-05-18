@@ -137,6 +137,14 @@ enum Phase {
     Error,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DestinationStatus {
+    Streaming,
+    Retrying,
+    Failed,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 struct AppState {
     phase:               Phase,
@@ -147,7 +155,8 @@ struct AppState {
     retry_count:         u32,
     error_message:       Option<String>,
     cpu_temp_celsius:    f32,
-    active_destinations: Vec<String>,   // display names of active RTMP targets
+    active_destinations:  Vec<String>,
+    destination_statuses: HashMap<String, DestinationStatus>,
     #[serde(skip)]
     stream_start:        Option<Instant>,
 }
@@ -167,6 +176,9 @@ impl AppState {
         self.phase               = Phase::Streaming;
         self.stream_start        = Some(Instant::now());
         self.cpu_temp_celsius    = temp;
+        self.destination_statuses = active.iter()
+            .map(|n| (n.clone(), DestinationStatus::Streaming))
+            .collect();
         self.active_destinations = active;
     }
 
@@ -642,6 +654,8 @@ async fn dest_supervisor(
             }
         };
         let spawned_at = Instant::now();
+        state.lock().await.destination_statuses
+            .insert(dest.name.clone(), DestinationStatus::Streaming);
         info!(destination = %dest.name, port, "push ffmpeg started");
 
         let crashed = tokio::select! {
@@ -660,15 +674,15 @@ async fn dest_supervisor(
 
         if retry_count > max_retries {
             error!(destination = %dest.name, "push failed after {max_retries} retries — giving up");
-            // Notify dashboard via state so it reflects the degraded destination
             let mut s = state.lock().await;
-            if !s.active_destinations.is_empty() {
-                s.active_destinations.retain(|n| *n != dest.name);
-            }
+            s.active_destinations.retain(|n| *n != dest.name);
+            s.destination_statuses.insert(dest.name.clone(), DestinationStatus::Failed);
             return;
         }
         warn!(destination = %dest.name,
             "push exited ({code}, lived {lived}s) — retry {retry_count}/{max_retries}");
+        state.lock().await.destination_statuses
+            .insert(dest.name.clone(), DestinationStatus::Retrying);
 
         tokio::select! {
             _ = sleep(Duration::from_secs(2)) => {}

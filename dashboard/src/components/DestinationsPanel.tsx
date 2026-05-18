@@ -1,9 +1,14 @@
 import { useState, useEffect, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api'
-import type { Destination } from '../types'
+import type { Destination, DestinationStatus, Phase } from '../types'
 
-export function DestinationsPanel() {
+interface PanelProps {
+  statuses: Record<string, DestinationStatus>
+  phase:    Phase
+}
+
+export function DestinationsPanel({ statuses, phase }: PanelProps) {
   const qc = useQueryClient()
   const { data: cfg, isLoading } = useQuery({
     queryKey: ['config'],
@@ -24,6 +29,8 @@ export function DestinationsPanel() {
     )
   }
 
+  const isLive = phase === 'streaming'
+
   return (
     <div className="bg-zinc-900 rounded-xl p-5 border border-zinc-800">
       <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-4">
@@ -34,6 +41,7 @@ export function DestinationsPanel() {
           <DestinationRow
             key={dest.id}
             dest={dest}
+            streamStatus={isLive ? statuses[dest.name] : undefined}
             onToggle={() => toggle(dest.id)}
           />
         ))}
@@ -42,7 +50,11 @@ export function DestinationsPanel() {
   )
 }
 
-function DestinationRow({ dest, onToggle }: { dest: Destination; onToggle: () => void }) {
+function DestinationRow({ dest, streamStatus, onToggle }: {
+  dest:         Destination
+  streamStatus: DestinationStatus | undefined
+  onToggle:     () => void
+}) {
   const qc = useQueryClient()
   const [editing,   setEditing]   = useState(false)
   const [rtmpUrl,   setRtmpUrl]   = useState(dest.rtmp_url)
@@ -90,11 +102,13 @@ function DestinationRow({ dest, onToggle }: { dest: Destination; onToggle: () =>
           {dest.enabled && keyHint === '(no key)' && (
             <span className="text-xs text-yellow-500">no key</span>
           )}
-          {/* Auth badge */}
-          {needsGoogle && dest.authenticated && (
+          {/* Live stream status */}
+          <StreamStatusBadge status={streamStatus} enabled={dest.enabled} />
+          {/* Auth badge (only when not streaming) */}
+          {!streamStatus && needsGoogle && dest.authenticated && (
             <span className="text-xs text-green-400 font-semibold">● connected</span>
           )}
-          {needsGoogle && !dest.authenticated && dest.has_credentials && (
+          {!streamStatus && needsGoogle && !dest.authenticated && dest.has_credentials && (
             <span className="text-xs text-yellow-400">○ not connected</span>
           )}
         </div>
@@ -340,6 +354,32 @@ function Toggle({ enabled, onToggle }: { enabled: boolean; onToggle: () => void 
                         ${enabled ? 'translate-x-4' : 'translate-x-1'}`} />
     </button>
   )
+}
+
+function StreamStatusBadge({ status, enabled }: { status: DestinationStatus | undefined; enabled: boolean }) {
+  if (!enabled) return null
+  if (status === 'streaming') {
+    return (
+      <span className="text-xs font-mono font-semibold text-green-400">
+        ● live
+      </span>
+    )
+  }
+  if (status === 'retrying') {
+    return (
+      <span className="text-xs font-mono font-semibold text-yellow-400 animate-pulse">
+        ↻ retrying…
+      </span>
+    )
+  }
+  if (status === 'failed') {
+    return (
+      <span className="text-xs font-mono font-semibold text-red-400">
+        ✕ failed
+      </span>
+    )
+  }
+  return null
 }
 
 function PlatformIcon({ id }: { id: string }) {
