@@ -669,7 +669,10 @@ async fn dest_supervisor(
 
         let code  = crashed.unwrap().map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
         let lived = spawned_at.elapsed().as_secs();
-        if lived >= 5 { retry_count = 0; }
+        // Only reset the counter if the process ran long enough to be considered
+        // a real connection (30s). Short-lived crashes (bad key, auth fail) keep
+        // accumulating toward the retry limit so they eventually give up.
+        if lived >= 30 { retry_count = 0; }
         retry_count += 1;
 
         if retry_count > max_retries {
