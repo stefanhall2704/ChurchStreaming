@@ -368,87 +368,138 @@ async fn supervisor(
         'active: loop {
             let cfg     = config.lock().await.clone();
             let is_live = state.lock().await.phase == Phase::Streaming;
-
             clear_hls_dir();
 
-            let spawn_result = if is_live {
-                spawn_ffmpeg_full(&cfg)
-            } else {
-                spawn_ffmpeg_preview(&cfg)
-            };
-
-            let mut child = match spawn_result {
-                Ok(c)  => c,
-                Err(e) => {
-                    error!("spawn failed: {e:#}");
-                    state.lock().await.go_error(e.to_string());
-                    continue 'outer;
-                }
-            };
-
-            let spawned_at = Instant::now();
-            if is_live {
-                let names = active_names(&cfg);
-                info!("ffmpeg pid={} — SRT :{} (live → [{}])",
-                    child.id().unwrap_or(0), cfg.srt_port, names.join(", "));
-            } else {
-                info!("ffmpeg pid={} — SRT :{} (preview/HLS only)",
-                    child.id().unwrap_or(0), cfg.srt_port);
-            }
-
-            let stderr = child.stderr.take().expect("piped");
-            tokio::spawn(parse_telemetry(stderr, state.clone(), audio_tx.clone()));
-
-            loop {
-                tokio::select! {
-                    result = child.wait() => {
-                        let code  = result.map(|s| s.to_string())
-                                          .unwrap_or_else(|e| e.to_string());
-                        let lived = spawned_at.elapsed().as_secs();
-                        let retries = {
-                            let mut s = state.lock().await;
-                            if lived >= 5 { s.retry_count = 0; }
-                            s.retry_count += 1;
-                            s.bitrate_kbps = 0.0;
-                            s.fps          = 0.0;
-                            s.drop_frames  = 0;
-                            s.retry_count
-                        };
-                        let max = config.lock().await.max_retries;
-                        if retries <= max {
-                            warn!("ffmpeg exited ({code}, lived {lived}s) — self-heal {retries}/{max} in 2 s");
-                            sleep(Duration::from_secs(2)).await;
-                            continue 'active;
-                        }
-                        error!("ffmpeg exited after {max} retries — Error");
-                        state.lock().await.go_error(
-                            format!("exited after {max} retries: {code}")
-                        );
+            // ── Preview: single FFmpeg, HLS + audio only ──────────────────────
+            if !is_live {
+                let mut child = match spawn_ffmpeg_preview(&cfg) {
+                    Ok(c)  => c,
+                    Err(e) => {
+                        error!("spawn failed: {e:#}");
+                        state.lock().await.go_error(e.to_string());
                         continue 'outer;
                     }
+                };
+                info!("ffmpeg pid={} — SRT :{} (preview/HLS only)",
+                    child.id().unwrap_or(0), cfg.srt_port);
+                let stderr = child.stderr.take().expect("piped");
+                tokio::spawn(parse_telemetry(stderr, state.clone(), audio_tx.clone()));
+                let spawned_at = Instant::now();
 
-                    cmd = cmd_rx.recv() => match cmd {
-                        Some(Cmd::Stop) => {
-                            info!("Stop — graceful shutdown");
-                            graceful_kill(&mut child).await;
-                            state.lock().await.go_idle();
+                loop {
+                    tokio::select! {
+                        result = child.wait() => {
+                            let code  = result.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
+                            let lived = spawned_at.elapsed().as_secs();
+                            let retries = {
+                                let mut s = state.lock().await;
+                                if lived >= 5 { s.retry_count = 0; }
+                                s.retry_count += 1;
+                                s.bitrate_kbps = 0.0; s.fps = 0.0; s.drop_frames = 0;
+                                s.retry_count
+                            };
+                            let max = config.lock().await.max_retries;
+                            if retries <= max {
+                                warn!("ffmpeg exited ({code}, lived {lived}s) — self-heal {retries}/{max} in 2s");
+                                sleep(Duration::from_secs(2)).await;
+                                continue 'active;
+                            }
+                            error!("ffmpeg exited after {max} retries — Error");
+                            state.lock().await.go_error(format!("exited after {max} retries: {code}"));
                             continue 'outer;
                         }
-                        Some(Cmd::Start) => {
-                            let phase = state.lock().await.phase.clone();
-                            if phase == Phase::Streaming {
-                                warn!("Start ignored — already streaming");
-                            } else {
+                        cmd = cmd_rx.recv() => match cmd {
+                            Some(Cmd::Stop) => {
+                                info!("Stop — graceful shutdown");
+                                graceful_kill(&mut child).await;
+                                state.lock().await.go_idle();
+                                continue 'outer;
+                            }
+                            Some(Cmd::Start) => {
                                 info!("Promoting preview → live");
                                 graceful_kill(&mut child).await;
                                 let names = active_names(&*config.lock().await);
                                 state.lock().await.go_streaming(names);
                                 continue 'active;
                             }
+                            Some(Cmd::Preview) => warn!("Preview ignored — already active"),
+                            None => return,
                         }
+                    }
+                }
+            }
+
+            // ── Live: ingest FFmpeg → UDP → isolated per-destination push FFmpeg ──
+            let active: Vec<Destination> = cfg.active_destinations().into_iter().cloned().collect();
+            if active.is_empty() {
+                state.lock().await.go_error("no enabled destinations with stream keys");
+                continue 'outer;
+            }
+
+            // Dropping stop_tx (or calling send) signals all dest_supervisors to stop
+            let (stop_tx, _) = broadcast::channel::<()>(active.len() + 1);
+
+            // Push processes must bind their UDP ports before ingest starts sending
+            for (i, dest) in active.iter().enumerate() {
+                let port    = 5001u16 + i as u16;
+                let stop_rx = stop_tx.subscribe();
+                tokio::spawn(dest_supervisor(
+                    dest.clone(), port, cfg.max_retries, state.clone(), stop_rx,
+                ));
+            }
+            sleep(Duration::from_millis(300)).await;
+
+            let mut ingest = match spawn_ffmpeg_ingest(&cfg, active.len()) {
+                Ok(c)  => c,
+                Err(e) => {
+                    let _ = stop_tx.send(());
+                    state.lock().await.go_error(e.to_string());
+                    continue 'outer;
+                }
+            };
+            let spawned_at = Instant::now();
+            info!("ffmpeg ingest pid={} — SRT :{} → {} destination(s): [{}]",
+                ingest.id().unwrap_or(0), cfg.srt_port, active.len(),
+                active.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", "));
+
+            let stderr = ingest.stderr.take().expect("piped");
+            tokio::spawn(parse_telemetry(stderr, state.clone(), audio_tx.clone()));
+
+            loop {
+                tokio::select! {
+                    result = ingest.wait() => {
+                        let _ = stop_tx.send(());
+                        let code  = result.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
+                        let lived = spawned_at.elapsed().as_secs();
+                        let retries = {
+                            let mut s = state.lock().await;
+                            if lived >= 5 { s.retry_count = 0; }
+                            s.retry_count += 1;
+                            s.bitrate_kbps = 0.0; s.fps = 0.0; s.drop_frames = 0;
+                            s.retry_count
+                        };
+                        let max = config.lock().await.max_retries;
+                        if retries <= max {
+                            warn!("ingest exited ({code}, lived {lived}s) — self-heal {retries}/{max} in 2s");
+                            sleep(Duration::from_secs(2)).await;
+                            continue 'active;
+                        }
+                        error!("ingest exited after {max} retries — Error");
+                        state.lock().await.go_error(format!("exited after {max} retries: {code}"));
+                        continue 'outer;
+                    }
+                    cmd = cmd_rx.recv() => match cmd {
+                        Some(Cmd::Stop) => {
+                            info!("Stop — graceful shutdown");
+                            let _ = stop_tx.send(());
+                            graceful_kill(&mut ingest).await;
+                            state.lock().await.go_idle();
+                            continue 'outer;
+                        }
+                        Some(Cmd::Start) => warn!("Start ignored — already streaming"),
                         Some(Cmd::Preview) => warn!("Preview ignored — already active"),
                         None => return,
-                    },
+                    }
                 }
             }
         }
@@ -490,25 +541,20 @@ fn spawn_ffmpeg_preview(cfg: &Config) -> anyhow::Result<tokio::process::Child> {
         .context("failed to spawn ffmpeg (preview)")
 }
 
-// Full: SRT → tee(RTMP × N) + HLS + audio analysis.
-// Uses -f flv for a single destination, -f tee for multiple.
-fn spawn_ffmpeg_full(cfg: &Config) -> anyhow::Result<tokio::process::Child> {
-    let active = cfg.active_destinations();
-    anyhow::ensure!(!active.is_empty(), "no enabled destinations with stream keys");
+// Ingest: SRT → UDP fan-out (one port per destination) + HLS + audio analysis.
+// Push FFmpeg processes listen on the UDP ports; this process just sends to them.
+// UDP is non-blocking at the send level — a slow/dead destination cannot stall others.
+fn spawn_ffmpeg_ingest(cfg: &Config, num_dests: usize) -> anyhow::Result<tokio::process::Child> {
+    anyhow::ensure!(num_dests > 0, "no enabled destinations with stream keys");
 
     let hls_seg  = format!("{HLS_DIR}/seg%03d.ts");
     let hls_m3u8 = format!("{HLS_DIR}/stream.m3u8");
 
-    // Build the RTMP output section (single vs. tee muxer)
-    let (rtmp_fmt, rtmp_target): (&str, String) = if active.len() == 1 {
-        ("flv", active[0].push_url())
-    } else {
-        let tee = active.iter()
-            .map(|d| format!("[f=flv]{}", d.push_url()))
-            .collect::<Vec<_>>()
-            .join("|");
-        ("tee", tee)
-    };
+    // One UDP output per destination on ports 5001, 5002, …
+    let udp_outputs = (0..num_dests)
+        .map(|i| format!("[f=mpegts]udp://127.0.0.1:{}", 5001 + i))
+        .collect::<Vec<_>>()
+        .join("|");
 
     let args: Vec<String> = vec![
         "-hide_banner".into(), "-loglevel".into(), "warning".into(),
@@ -517,15 +563,12 @@ fn spawn_ffmpeg_full(cfg: &Config) -> anyhow::Result<tokio::process::Child> {
         "-err_detect".into(), "ignore_err".into(),
         "-rw_timeout".into(), "7000000".into(),
         "-i".into(), cfg.srt_url(),
-        // RTMP egress — single destination or tee muxer fan-out
-        "-map".into(), "0:v".into(),
-        "-map".into(), "0:a".into(),
+        // UDP fan-out to per-destination push processes
+        "-map".into(), "0:v".into(), "-map".into(), "0:a".into(),
         "-c".into(), "copy".into(),
-        "-f".into(), rtmp_fmt.into(),
-        rtmp_target,
-        // HLS preview (unchanged from preview mode)
-        "-map".into(), "0:v".into(),
-        "-map".into(), "0:a".into(),
+        "-f".into(), "tee".into(), udp_outputs,
+        // HLS preview (unchanged)
+        "-map".into(), "0:v".into(), "-map".into(), "0:a".into(),
         "-c".into(), "copy".into(),
         "-f".into(), "hls".into(),
         "-hls_time".into(), "2".into(),
@@ -533,11 +576,10 @@ fn spawn_ffmpeg_full(cfg: &Config) -> anyhow::Result<tokio::process::Child> {
         "-hls_flags".into(), "delete_segments".into(),
         "-hls_segment_filename".into(), hls_seg,
         hls_m3u8,
-        // Audio loudness analysis (untouched)
+        // Audio loudness analysis
         "-map".into(), "0:a".into(),
         "-af".into(), "ebur128=framelog=24".into(),
-        "-f".into(), "null".into(),
-        "-".into(),
+        "-f".into(), "null".into(), "-".into(),
     ];
 
     Command::new("ffmpeg")
@@ -545,7 +587,97 @@ fn spawn_ffmpeg_full(cfg: &Config) -> anyhow::Result<tokio::process::Child> {
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .context("failed to spawn ffmpeg (full)")
+        .context("failed to spawn ffmpeg (ingest)")
+}
+
+// Push: UDP loopback → RTMP for one destination.
+// 5 MB FIFO: at 6000 kbps (~750 KB/s) this is ~6.7 s of headroom per destination.
+fn spawn_ffmpeg_push(dest: &Destination, port: u16) -> anyhow::Result<tokio::process::Child> {
+    let push_url = dest.push_url();
+    let udp_in   = format!(
+        "udp://127.0.0.1:{port}?overrun_nonfatal=1&fifo_size=5000000&buffer_size=5242880"
+    );
+    Command::new("ffmpeg")
+        .args([
+            "-hide_banner", "-loglevel", "warning",
+            "-fflags", "+discardcorrupt",
+            "-err_detect", "ignore_err",
+            "-i", &udp_in,
+            "-c", "copy",
+            "-f", "flv",
+            &push_url,
+        ])
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context(format!("failed to spawn ffmpeg push ({})", dest.name))
+}
+
+// ── Per-destination push supervisor ──────────────────────────────────────────
+
+// Resolves when a stop is signalled or the broadcast channel is closed.
+async fn recv_stop(rx: &mut broadcast::Receiver<()>) {
+    match rx.recv().await {
+        Ok(()) | Err(broadcast::error::RecvError::Closed) => {}
+        Err(broadcast::error::RecvError::Lagged(_)) => {}
+    }
+}
+
+// Manages one push FFmpeg process independently — retries on crash, stops cleanly
+// on a stop signal. Isolated from all other destinations.
+async fn dest_supervisor(
+    dest:        Destination,
+    port:        u16,
+    max_retries: u32,
+    state:       Shared,
+    mut stop_rx: broadcast::Receiver<()>,
+) {
+    let mut retry_count = 0u32;
+    loop {
+        let mut child = match spawn_ffmpeg_push(&dest, port) {
+            Ok(c)  => c,
+            Err(e) => {
+                error!(destination = %dest.name, "push spawn failed: {e:#}");
+                return;
+            }
+        };
+        let spawned_at = Instant::now();
+        info!(destination = %dest.name, port, "push ffmpeg started");
+
+        let crashed = tokio::select! {
+            result = child.wait() => Some(result),
+            _ = recv_stop(&mut stop_rx) => {
+                graceful_kill(&mut child).await;
+                info!(destination = %dest.name, "push stopped");
+                return;
+            }
+        };
+
+        let code  = crashed.unwrap().map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
+        let lived = spawned_at.elapsed().as_secs();
+        if lived >= 5 { retry_count = 0; }
+        retry_count += 1;
+
+        if retry_count > max_retries {
+            error!(destination = %dest.name, "push failed after {max_retries} retries — giving up");
+            // Notify dashboard via state so it reflects the degraded destination
+            let mut s = state.lock().await;
+            if !s.active_destinations.is_empty() {
+                s.active_destinations.retain(|n| *n != dest.name);
+            }
+            return;
+        }
+        warn!(destination = %dest.name,
+            "push exited ({code}, lived {lived}s) — retry {retry_count}/{max_retries}");
+
+        tokio::select! {
+            _ = sleep(Duration::from_secs(2)) => {}
+            _ = recv_stop(&mut stop_rx) => {
+                info!(destination = %dest.name, "push stopped during backoff");
+                return;
+            }
+        }
+    }
 }
 
 async fn graceful_kill(child: &mut tokio::process::Child) {
