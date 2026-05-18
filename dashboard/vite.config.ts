@@ -1,0 +1,18 @@
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+const PI = 'http://100.116.183.59:3030'
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    host: '0.0.0.0',
+    port: 5173,
+    proxy: {
+      '/api':     { target: PI, changeOrigin: true },
+      '/metrics': { target: PI, changeOrigin: true },
+      '/hls':     { target: PI, changeOrigin: true },
+      '/ws':      { target: PI.replace('http', 'ws'), ws: true },
+    },
+  },
+})

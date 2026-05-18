@@ -1,0 +1,63 @@
+name: Build & Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Dashboard (must build before Rust so rust-embed can embed dist/) ──
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Build dashboard
+        working-directory: dashboard
+        run: npm ci && npm run build
+
+      # ── Rust cross-compile for ARM64 ──
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: aarch64
+
+      - name: Install cargo-zigbuild
+        run: pip install ziglang && cargo install --locked cargo-zigbuild
+
+      - name: Build stream-bridge
+        run: cargo zigbuild --release --target aarch64-unknown-linux-gnu -p stream-bridge
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stream-bridge-aarch64
+          path: target/aarch64-unknown-linux-gnu/release/stream-bridge
+          retention-days: 7
+
+  deploy:
+    needs: build
+    runs-on: [self-hosted, raspberry-pi]
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: stream-bridge-aarch64
+
+      - name: Deploy
+        run: sudo /usr/local/bin/deploy-stream-bridge.sh "$PWD/stream-bridge"
+
+      - name: Smoke test
+        run: |
+          sleep 3
+          curl -sf http://localhost:3030/api/status | grep -q '"phase"'

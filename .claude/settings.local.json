@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ssh -o BatchMode=yes -o ConnectTimeout=5 -i ~/.ssh/id_ed25519 stefan@100.116.183.59 'echo key_works')",
+      "Bash(ssh *)",
+      "Bash(rustup target *)",
+      "Bash(cargo install *)",
+      "Bash(cargo --version)",
+      "Bash(rustc --version)",
+      "Bash(rsync *)",
+      "Bash(cargo zigbuild *)",
+      "Bash(scp -o PreferredAuthentications=password -o PubkeyAuthentication=no /home/stefan/Documents/Church/church-streamer/target/aarch64-unknown-linux-gnu/release/stream-bridge stefan@100.116.183.59:/home/stefan/stream-bridge-new)",
+      "Bash(scp *)"
+    ]
+  }
+}
