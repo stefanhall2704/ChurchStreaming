@@ -33,8 +33,9 @@ export function VideoPreview({ phase }: Props) {
     const hlsUrl = () => `/hls/stream.m3u8?_=${Date.now()}`
 
     const hls = new Hls({
-      liveSyncDurationCount:       1,
-      liveMaxLatencyDurationCount: 3,
+      liveSyncDurationCount:       2,
+      liveMaxLatencyDurationCount: 4,
+      startPosition:               -1,   // always join at live edge
       manifestLoadingMaxRetry:     10,
       manifestLoadingRetryDelay:   1500,
       levelLoadingMaxRetry:        6,
@@ -42,8 +43,7 @@ export function VideoPreview({ phase }: Props) {
 
     const reload = () => {
       hls.loadSource(hlsUrl())
-      hls.startLoad()
-      video.play().catch(() => {})
+      hls.startLoad(-1)   // -1 = live edge; 0 would restart from playlist beginning
     }
 
     hls.on(Hls.Events.ERROR, (_, data) => {
@@ -68,7 +68,21 @@ export function VideoPreview({ phase }: Props) {
     hls.attachMedia(video)
     hlsRef.current = hls
 
+    // Stall watchdog: if currentTime hasn't moved in 3 s while "playing",
+    // the decoder is frozen — snap back to the live edge and resume.
+    let lastTime = -1
+    const watchdog = window.setInterval(() => {
+      if (video.paused || video.ended) return
+      if (video.currentTime === lastTime) {
+        const liveEdge = (hls as any).liveSyncPosition ?? null
+        if (liveEdge !== null) video.currentTime = liveEdge
+        video.play().catch(() => {})
+      }
+      lastTime = video.currentTime
+    }, 3000)
+
     return () => {
+      clearInterval(watchdog)
       hls.destroy()
       hlsRef.current = null
     }
