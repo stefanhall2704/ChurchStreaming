@@ -66,31 +66,66 @@ export function VideoPreview({ phase }: Props) {
     hls.on(Hls.Events.BUFFER_EOS, () => { setTimeout(reattach, 2000) })
 
     hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}) })
+
+    // Browser fires 'stalled' when it can't get data for several seconds.
+    // Jump to the buffered live edge so playback can resume immediately.
+    const onStalled = () => {
+      const buf = video.buffered
+      if (buf.length > 0) video.currentTime = Math.max(buf.end(buf.length - 1) - 0.1, 0)
+      video.play().catch(() => {})
+    }
+    video.addEventListener('stalled', onStalled)
+
     hls.loadSource(hlsUrl())
     hls.attachMedia(video)
     hlsRef.current = hls
 
     // Stall watchdog — runs every 3 s.
-    // - video.ended: ENDLIST was hit and played out — reattach immediately.
-    // - currentTime frozen while playing: seek to live edge and resume.
-    let lastTime = -1
+    // - video.ended / BUFFER_EOS: full reattach to create a fresh MediaSource.
+    // - currentTime frozen: first try seeking into the buffered range; if still
+    //   frozen after another 3 s, do a full reattach.
+    // - video.paused: try play(); if it won't start, reattach after 2 ticks.
+    let lastTime  = -1
+    let stallTick = 0
+    const tryRecover = () => {
+      // Prefer seeking to the end of the highest buffered range so we land
+      // inside data HLS.js already has rather than a gap.
+      const buf = video.buffered
+      if (buf.length > 0) {
+        video.currentTime = Math.max(buf.end(buf.length - 1) - 0.1, 0)
+      } else {
+        const edge = (hls as any).liveSyncPosition as number | null
+        if (edge != null) video.currentTime = edge
+      }
+      video.play().catch(() => {})
+    }
+
     const watchdog = window.setInterval(() => {
       if (video.ended) {
-        reattach()
-        lastTime = -1
+        reattach(); lastTime = -1; stallTick = 0; return
+      }
+      if (video.paused) {
+        stallTick++
+        video.play().catch(() => {})
+        if (stallTick >= 2) { reattach(); lastTime = -1; stallTick = 0 }
         return
       }
-      if (video.paused) return
       if (video.currentTime === lastTime) {
-        const liveEdge = (hls as any).liveSyncPosition as number | null
-        if (liveEdge != null) video.currentTime = liveEdge
-        video.play().catch(() => {})
+        stallTick++
+        if (stallTick >= 2) {
+          reattach(); lastTime = -1; stallTick = 0
+        } else {
+          tryRecover()
+        }
+      } else {
+        stallTick = 0
+        lastTime  = video.currentTime
       }
-      lastTime = video.currentTime
     }, 3000)
 
     return () => {
       clearInterval(watchdog)
+      video.removeEventListener('stalled', onStalled)
       hls.destroy()
       hlsRef.current = null
     }
