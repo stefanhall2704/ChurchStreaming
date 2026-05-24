@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import Hls from 'hls.js'
 import type { Phase } from '../types'
 
@@ -9,11 +9,35 @@ interface Props {
 export function VideoPreview({ phase }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const hlsRef   = useRef<Hls | null>(null)
+  const [hlsReady, setHlsReady] = useState(false)
 
   const active = phase === 'streaming' || phase === 'preview'
 
+  // Poll /hls/stream.m3u8 with plain fetch() until it returns 200.
+  // Only then start HLS.js — this prevents the 404 retry storm that happens
+  // when OBS hasn't connected yet or FFmpeg is still writing the first segment.
   useEffect(() => {
-    if (!active) {
+    if (!active) { setHlsReady(false); return }
+
+    setHlsReady(false)
+    let cancelled = false
+
+    ;(async () => {
+      while (!cancelled) {
+        try {
+          const r = await fetch(`/hls/stream.m3u8?_=${Date.now()}`, { cache: 'no-store' })
+          if (r.ok) { if (!cancelled) setHlsReady(true); return }
+        } catch { /* network error — keep polling */ }
+        await new Promise<void>(res => setTimeout(res, 2000))
+      }
+    })()
+
+    return () => { cancelled = true }
+  }, [active])
+
+  // Start HLS.js only once the manifest is confirmed available.
+  useEffect(() => {
+    if (!hlsReady) {
       hlsRef.current?.destroy()
       hlsRef.current = null
       return
@@ -41,9 +65,8 @@ export function VideoPreview({ phase }: Props) {
       levelLoadingMaxRetry:        6,
     })
 
-    // When FFmpeg writes #EXT-X-ENDLIST the underlying MediaSource is sealed
-    // (ended state) and cannot accept new data. loadSource() alone is not
-    // enough — we must detach + reattach to create a brand-new MediaSource.
+    // Track when we last reattached so the watchdog doesn't interrupt
+    // HLS.js's own manifest retry sequence (10 retries × 1.5 s = 15 s).
     let lastReattach = 0
     const reattach = () => {
       lastReattach = Date.now()
@@ -63,14 +86,11 @@ export function VideoPreview({ phase }: Props) {
       }
     })
 
-    // EXT-X-ENDLIST received — MediaSource is now ended. Reattach after a
-    // short delay so the next FFmpeg session has time to write its first segment.
+    // EXT-X-ENDLIST received — MediaSource is ended; reattach to get a fresh one.
     hls.on(Hls.Events.BUFFER_EOS, () => { setTimeout(reattach, 2000) })
-
     hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}) })
 
-    // Browser fires 'stalled' when it can't get data for several seconds.
-    // Jump to the buffered live edge so playback can resume immediately.
+    // Jump to buffered live edge when the browser fires 'stalled'.
     const onStalled = () => {
       const buf = video.buffered
       if (buf.length > 0) video.currentTime = Math.max(buf.end(buf.length - 1) - 0.1, 0)
@@ -82,16 +102,11 @@ export function VideoPreview({ phase }: Props) {
     hls.attachMedia(video)
     hlsRef.current = hls
 
-    // Stall watchdog — runs every 3 s.
-    // - video.ended / BUFFER_EOS: full reattach to create a fresh MediaSource.
-    // - currentTime frozen: first try seeking into the buffered range; if still
-    //   frozen after another 3 s, do a full reattach.
-    // - video.paused: try play(); if it won't start, reattach after 2 ticks.
+    // Stall watchdog — runs every 3 s. Backs off 15 s after each reattach so
+    // HLS.js has time to complete its natural manifest retry sequence.
     let lastTime  = -1
     let stallTick = 0
     const tryRecover = () => {
-      // Prefer seeking to the end of the highest buffered range so we land
-      // inside data HLS.js already has rather than a gap.
       const buf = video.buffered
       if (buf.length > 0) {
         video.currentTime = Math.max(buf.end(buf.length - 1) - 0.1, 0)
@@ -103,9 +118,6 @@ export function VideoPreview({ phase }: Props) {
     }
 
     const watchdog = window.setInterval(() => {
-      // After a reattach, give HLS.js 15 s to naturally retry the manifest
-      // before the watchdog intervenes. Interfering sooner resets the retry
-      // sequence and produces a 404 storm.
       if (Date.now() - lastReattach < 15_000) return
 
       if (video.ended) {
@@ -136,7 +148,7 @@ export function VideoPreview({ phase }: Props) {
       hls.destroy()
       hlsRef.current = null
     }
-  }, [active])
+  }, [hlsReady])
 
   return (
     <div className="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden">
@@ -153,6 +165,11 @@ export function VideoPreview({ phase }: Props) {
       {!active ? (
         <div className="aspect-video flex items-center justify-center text-zinc-600 text-sm bg-zinc-950">
           Waiting for stream…
+        </div>
+      ) : !hlsReady ? (
+        <div className="aspect-video flex items-center justify-center bg-zinc-950 flex-col gap-2">
+          <div className="text-zinc-500 text-sm">Waiting for OBS…</div>
+          <div className="text-zinc-700 text-xs">Start streaming in OBS to begin preview</div>
         </div>
       ) : (
         <video
