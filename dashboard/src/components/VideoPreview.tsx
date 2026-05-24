@@ -35,47 +35,55 @@ export function VideoPreview({ phase }: Props) {
     const hls = new Hls({
       liveSyncDurationCount:       2,
       liveMaxLatencyDurationCount: 4,
-      startPosition:               -1,   // always join at live edge
+      startPosition:               -1,
       manifestLoadingMaxRetry:     10,
       manifestLoadingRetryDelay:   1500,
       levelLoadingMaxRetry:        6,
     })
 
-    const reload = () => {
+    // When FFmpeg writes #EXT-X-ENDLIST the underlying MediaSource is sealed
+    // (ended state) and cannot accept new data. loadSource() alone is not
+    // enough — we must detach + reattach to create a brand-new MediaSource.
+    const reattach = () => {
+      hls.detachMedia()
       hls.loadSource(hlsUrl())
-      hls.startLoad(-1)   // -1 = live edge; 0 would restart from playlist beginning
+      hls.attachMedia(video)
     }
 
     hls.on(Hls.Events.ERROR, (_, data) => {
       if (!data.fatal) return
       if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-        // m3u8 not ready yet or gap during FFmpeg restart — keep retrying
-        setTimeout(reload, 2000)
+        setTimeout(reattach, 2000)
       } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
         hls.recoverMediaError()
       } else {
-        // Unrecoverable — full reload after delay
-        setTimeout(reload, 3000)
+        setTimeout(reattach, 3000)
       }
     })
 
-    // FFmpeg exited and wrote #EXT-X-ENDLIST — hls.js stops polling after this.
-    // Force a reload so we pick up the next FFmpeg session's segments.
-    hls.on(Hls.Events.BUFFER_EOS, () => { setTimeout(reload, 2000) })
+    // EXT-X-ENDLIST received — MediaSource is now ended. Reattach after a
+    // short delay so the next FFmpeg session has time to write its first segment.
+    hls.on(Hls.Events.BUFFER_EOS, () => { setTimeout(reattach, 2000) })
 
     hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}) })
     hls.loadSource(hlsUrl())
     hls.attachMedia(video)
     hlsRef.current = hls
 
-    // Stall watchdog: if currentTime hasn't moved in 3 s while "playing",
-    // the decoder is frozen — snap back to the live edge and resume.
+    // Stall watchdog — runs every 3 s.
+    // - video.ended: ENDLIST was hit and played out — reattach immediately.
+    // - currentTime frozen while playing: seek to live edge and resume.
     let lastTime = -1
     const watchdog = window.setInterval(() => {
-      if (video.paused || video.ended) return
+      if (video.ended) {
+        reattach()
+        lastTime = -1
+        return
+      }
+      if (video.paused) return
       if (video.currentTime === lastTime) {
-        const liveEdge = (hls as any).liveSyncPosition ?? null
-        if (liveEdge !== null) video.currentTime = liveEdge
+        const liveEdge = (hls as any).liveSyncPosition as number | null
+        if (liveEdge != null) video.currentTime = liveEdge
         video.play().catch(() => {})
       }
       lastTime = video.currentTime

@@ -724,13 +724,35 @@ fn parse_ebur128_m(line: &str) -> Option<f32> {
 }
 
 // Parse "HH:MM:SS.mmm" from -progress out_time into fractional seconds.
-fn parse_out_time(s: &str) -> Option<f64> {
-    let parts: Vec<&str> = s.trim().splitn(3, ':').collect();
-    if parts.len() != 3 { return None; }
-    let h: f64 = parts[0].parse().ok()?;
-    let m: f64 = parts[1].parse().ok()?;
-    let s: f64 = parts[2].parse().ok()?;
-    Some(h * 3600.0 + m * 60.0 + s)
+// Estimate bitrate by reading the HLS segment files currently listed in the
+// playlist. For HLS output, FFmpeg's -progress total_size resets per segment,
+// making delta computation unreliable. Reading actual segment sizes from disk
+// is accurate and cheap (files are tiny, already in /dev/shm).
+fn estimate_hls_bitrate_kbps() -> f32 {
+    let m3u8 = match std::fs::read_to_string(format!("{HLS_DIR}/stream.m3u8")) {
+        Ok(s) => s,
+        Err(_) => return 0.0,
+    };
+    let mut total_bytes: u64 = 0;
+    let mut total_secs:  f64 = 0.0;
+    let mut next_dur: Option<f64> = None;
+    for line in m3u8.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("#EXTINF:") {
+            next_dur = rest.split(',').next().and_then(|d| d.parse().ok());
+        } else if !line.starts_with('#') && !line.is_empty() {
+            let seg = format!("{HLS_DIR}/{line}");
+            if let (Ok(meta), Some(dur)) = (std::fs::metadata(&seg), next_dur.take()) {
+                total_bytes += meta.len();
+                total_secs  += dur;
+            }
+        }
+    }
+    if total_secs > 0.0 && total_bytes > 0 {
+        (total_bytes as f64 * 8.0 / total_secs / 1000.0) as f32
+    } else {
+        0.0
+    }
 }
 
 async fn parse_telemetry(
@@ -740,9 +762,6 @@ async fn parse_telemetry(
 ) {
     let mut lines = BufReader::new(stderr).lines();
     let mut kv: HashMap<String, String> = HashMap::new();
-    // For computing instantaneous bitrate from total_size / out_time deltas.
-    let mut last_size: u64 = 0;
-    let mut last_secs: f64 = 0.0;
 
     while let Ok(Some(line)) = lines.next_line().await {
         let line = line.trim().to_owned();
@@ -753,30 +772,15 @@ async fn parse_telemetry(
                 if k == "progress" {
                     let mut s = state.lock().await;
 
-                    // Prefer FFmpeg's own bitrate field (available for RTMP/UDP outputs).
-                    // Fall back to computing from total_size delta when it reports N/A
-                    // (happens with HLS+delete_segments because there's no output file).
-                    let reported_kb = kv.get("bitrate")
+                    // Use FFmpeg's reported bitrate when available (RTMP/UDP outputs).
+                    // For HLS, total_size resets per segment so FFmpeg reports N/A;
+                    // fall back to reading actual segment sizes from /dev/shm/hls.
+                    let bitrate = kv.get("bitrate")
                         .and_then(|v| v.strip_suffix("kbits/s"))
-                        .and_then(|v| v.trim().parse::<f32>().ok());
-
-                    if let Some(kb) = reported_kb {
-                        s.bitrate_kbps = kb;
-                    } else if let (Some(sz), Some(ot)) =
-                        (kv.get("total_size"), kv.get("out_time"))
-                    {
-                        if let (Ok(size), Some(secs)) =
-                            (sz.parse::<u64>(), parse_out_time(ot))
-                        {
-                            let dsz  = size.saturating_sub(last_size) as f64;
-                            let dt   = secs - last_secs;
-                            if dt > 0.0 && dsz > 0.0 {
-                                s.bitrate_kbps = (dsz * 8.0 / dt / 1000.0) as f32;
-                            }
-                            last_size = size;
-                            last_secs = secs;
-                        }
-                    }
+                        .and_then(|v| v.trim().parse::<f32>().ok())
+                        .filter(|&kb| kb > 0.0)
+                        .unwrap_or_else(estimate_hls_bitrate_kbps);
+                    s.bitrate_kbps = bitrate;
 
                     if let Ok(fps) = kv.get("fps").map(String::as_str).unwrap_or("").parse::<f32>()
                     { s.fps = fps; }
