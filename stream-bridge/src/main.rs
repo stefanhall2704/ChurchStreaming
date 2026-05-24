@@ -208,6 +208,7 @@ type Shared = Arc<Mutex<AppState>>;
 // ── Control Channel ───────────────────────────────────────────────────────────
 
 #[derive(Debug)]
+#[derive(PartialEq)]
 enum Cmd { Preview, Start, Stop }
 
 // ── Axum Context ─────────────────────────────────────────────────────────────
@@ -368,18 +369,21 @@ async fn supervisor(
             }
         };
 
-        match first {
-            Cmd::Preview => state.lock().await.go_preview(),
-            _ => {
-                let names = active_names(&*config.lock().await);
-                state.lock().await.go_streaming(names);
-            }
+        let is_preview = first == Cmd::Preview;
+        if !is_preview {
+            let names = active_names(&*config.lock().await);
+            state.lock().await.go_streaming(names);
         }
-        info!("Activated — phase={:?}", state.lock().await.phase);
+        // For preview, go_preview() is deferred until the first HLS segment is
+        // written — see below. The phase stays Idle until then so the browser
+        // doesn't start HLS.js before a manifest exists.
+        info!("Activated — command={}", if is_preview { "Preview" } else { "Start" });
+
+        let mut preview_announced = false; // set once per 'outer iteration
 
         'active: loop {
             let cfg     = config.lock().await.clone();
-            let is_live = state.lock().await.phase == Phase::Streaming;
+            let is_live = !is_preview || state.lock().await.phase == Phase::Streaming;
             clear_hls_dir();
 
             // ── Preview: single FFmpeg, HLS + audio only ──────────────────────
@@ -396,6 +400,22 @@ async fn supervisor(
                     child.id().unwrap_or(0), cfg.srt_port);
                 let stderr = child.stderr.take().expect("piped");
                 tokio::spawn(parse_telemetry(stderr, state.clone(), audio_tx.clone()));
+
+                // Wait up to 10 s for FFmpeg to write the first HLS manifest.
+                // Only surface Preview phase once we know something is there —
+                // this prevents the 404 cascade when HLS.js starts before the
+                // m3u8 exists.
+                if !preview_announced {
+                    let m3u8_path = format!("{HLS_DIR}/stream.m3u8");
+                    for _ in 0u8..20 {
+                        if tokio::fs::metadata(&m3u8_path).await.is_ok() { break; }
+                        sleep(Duration::from_millis(500)).await;
+                    }
+                    state.lock().await.go_preview();
+                    preview_announced = true;
+                    info!("HLS ready — phase=Preview");
+                }
+
                 let spawned_at = Instant::now();
 
                 loop {

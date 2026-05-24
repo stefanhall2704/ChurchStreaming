@@ -44,7 +44,9 @@ export function VideoPreview({ phase }: Props) {
     // When FFmpeg writes #EXT-X-ENDLIST the underlying MediaSource is sealed
     // (ended state) and cannot accept new data. loadSource() alone is not
     // enough — we must detach + reattach to create a brand-new MediaSource.
+    let lastReattach = 0
     const reattach = () => {
+      lastReattach = Date.now()
       hls.detachMedia()
       hls.loadSource(hlsUrl())
       hls.attachMedia(video)
@@ -101,6 +103,11 @@ export function VideoPreview({ phase }: Props) {
     }
 
     const watchdog = window.setInterval(() => {
+      // After a reattach, give HLS.js 15 s to naturally retry the manifest
+      // before the watchdog intervenes. Interfering sooner resets the retry
+      // sequence and produces a 404 storm.
+      if (Date.now() - lastReattach < 15_000) return
+
       if (video.ended) {
         reattach(); lastTime = -1; stallTick = 0; return
       }
