@@ -584,7 +584,10 @@ fn spawn_ffmpeg_ingest(cfg: &Config, num_dests: usize) -> anyhow::Result<tokio::
 
     // One UDP output per destination on ports 5001, 5002, …
     let udp_outputs = (0..num_dests)
-        .map(|i| format!("[f=mpegts]udp://127.0.0.1:{}", 5001 + i))
+        // ignore_io_errors=1 keeps the tee muxer alive if one destination's
+        // push process dies (its UDP port closes → ECONNREFUSED would otherwise
+        // stall writes to every other destination in the same tee cycle).
+        .map(|i| format!("[f=mpegts:ignore_io_errors=1]udp://127.0.0.1:{}", 5001 + i))
         .collect::<Vec<_>>()
         .join("|");
 
